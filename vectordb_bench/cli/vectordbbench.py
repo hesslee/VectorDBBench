@@ -1,5 +1,6 @@
 from ..backend.clients.adbpg.cli import AdbpgNova
 from ..backend.clients.alisql.cli import AliSQLHNSW
+from ..backend.clients.altibase.cli import AltibaseHNSW
 from ..backend.clients.alloydb.cli import AlloyDBScaNN
 from ..backend.clients.aws_opensearch.cli import AWSOpenSearch
 from ..backend.clients.chroma.cli import Chroma
@@ -57,6 +58,7 @@ from .batch_cli import BatchCli
 from .cli import cli
 
 cli.add_command(AdbpgNova)
+cli.add_command(AltibaseHNSW)
 cli.add_command(PgVectorHNSW)
 cli.add_command(PgVectoRSHNSW)
 cli.add_command(PgVectoRSIVFFlat)

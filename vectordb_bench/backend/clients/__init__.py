@@ -65,6 +65,7 @@ class DB(Enum):
     SeekDB = "SeekDB"
     VolcMySQL = "VolcMySQL"
     Adbpg = "AnalyticDB for PostgreSQL"
+    Altibase = "Altibase"
 
     @property
     def init_cls(self) -> type[VectorDB]:  # noqa: PLR0911, PLR0912, C901, PLR0915
@@ -280,6 +281,11 @@ class DB(Enum):
             from .adbpg.adbpg import Adbpg
 
             return Adbpg
+
+        if self == DB.Altibase:
+            from .altibase.altibase import Altibase
+
+            return Altibase
 
         msg = f"Unknown DB: {self.name}"
         raise ValueError(msg)
@@ -499,6 +505,11 @@ class DB(Enum):
 
             return AdbpgConfig
 
+        if self == DB.Altibase:
+            from .altibase.config import AltibaseConfig
+
+            return AltibaseConfig
+
         msg = f"Unknown DB: {self.name}"
         raise ValueError(msg)
 
@@ -714,6 +725,11 @@ class DB(Enum):
             from .adbpg.config import AdbpgIndexConfig
 
             return AdbpgIndexConfig
+
+        if self == DB.Altibase:
+            from .altibase.config import _altibase_case_config
+
+            return _altibase_case_config.get(index_type)
 
         # DB.Pinecone, DB.Redis
         return EmptyDBCaseConfig
