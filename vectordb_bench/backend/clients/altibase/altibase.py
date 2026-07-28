@@ -15,9 +15,15 @@ import pyodbc
 from vectordb_bench.backend.filter import Filter, FilterOp
 
 from ..api import VectorDB
+from .altibase_odbc import BinaryVectorInserter
 from .config import AltibaseConfigDict, AltibaseHNSWConfig
 
 log = logging.getLogger(__name__)
+
+# Optional cap on how many rows are actually pushed (0 = no cap). The binary
+# bind path is fast, so the cap is disabled by default; set >0 for quick smoke
+# runs. The cap is per client instance/connection (per-process under concurrency).
+MAX_UPLOAD_ROWS = 0
 
 
 class Altibase(VectorDB):
@@ -44,10 +50,16 @@ class Altibase(VectorDB):
         self.case_config = db_case_config
         self.dim = dim
 
+        self.cli_connection_string = db_config.get("cli_connection_string", "")
+        self.cli_lib = db_config.get("cli_lib", "")
+        self.use_binary_bind = db_config.get("use_binary_bind", False)
+
         self._index_name = f"{self.table_name}_hnsw"
         self._primary_field = "id"
         self._vector_field = "v"
         self.where_clause = ""
+        self._inserted_total = 0
+        self._binary = None
 
         self.conn, self.cursor = self._create_connection(self.connection_string)
         if drop_old:
@@ -98,9 +110,28 @@ class Altibase(VectorDB):
             f"INSERT INTO {self.table_name} "
             f"({self._primary_field}, {self._vector_field}) VALUES (?, ?)"
         )
+
+        # Open a dedicated CLI connection for the binary SQL_C_VECTOR insert
+        # path. If it can't be established, fall back to text inserts.
+        self._binary = None
+        if self.use_binary_bind:
+            try:
+                self._binary = BinaryVectorInserter(
+                    self.cli_lib, self.cli_connection_string,
+                    self.table_name, self.dim,
+                    id_field=self._primary_field, vec_field=self._vector_field,
+                )
+                log.info(f"{self.name}: binary VECTOR bind enabled (SQL_C_VECTOR)")
+            except Exception as e:
+                log.warning(f"{self.name}: binary bind unavailable, using text bind: {e}")
+                self._binary = None
+
         try:
             yield
         finally:
+            if self._binary is not None:
+                self._binary.close()
+                self._binary = None
             self.cursor.close()
             self.conn.close()
             self.cursor = None
@@ -115,13 +146,41 @@ class Altibase(VectorDB):
         assert self.conn is not None, "Connection is not initialized"
         assert self.cursor is not None, "Cursor is not initialized"
 
+        # TEMPORARY row cap: persist at most MAX_UPLOAD_ROWS, but still report the
+        # whole batch as inserted so the runner's per-batch accounting
+        # (already_insert_count == len(metadata)) stays consistent.
+        take = len(metadata)
+        if MAX_UPLOAD_ROWS > 0:
+            remaining = MAX_UPLOAD_ROWS - self._inserted_total
+            take = max(0, min(remaining, len(metadata)))
+
         try:
-            rows = [
-                (int(metadata[i]), self._vec_literal(embeddings[i]))
-                for i in range(len(metadata))
-            ]
-            self.cursor.executemany(self._insert_sql, rows)
-            self.conn.commit()
+            if self._binary is not None:
+                # Fast path: raw float[dim] array via SQL_C_VECTOR (no parsing).
+                if take:
+                    self._binary.insert(metadata[:take], embeddings[:take])
+            else:
+                # Text fallback: inline the vector as a literal rather than
+                # binding it. A long bound string makes pyodbc pick
+                # SQL_WLONGVARCHAR (HY004) or stream via SQLPutData (HY019), both
+                # rejected by the driver; inlining sidesteps ODBC type inference
+                # (same approach as search_embedding). The literal is digits,
+                # comma, minus, dot and 'e' only, so there is no injection surface.
+                for i in range(take):
+                    self.cursor.execute(
+                        f"INSERT INTO {self.table_name} "
+                        f"({self._primary_field}, {self._vector_field}) "
+                        f"VALUES ({int(metadata[i])}, '{self._vec_literal(embeddings[i])}')"
+                    )
+                if take:
+                    self.conn.commit()
+            self._inserted_total += take
+            if take < len(metadata):
+                log.info(
+                    f"{self.name}: upload cap {MAX_UPLOAD_ROWS} reached "
+                    f"(persisted {self._inserted_total}); skipped {len(metadata) - take} "
+                    f"row(s) of this batch"
+                )
             return len(metadata), None
         except Exception as e:
             log.warning(f"Failed to insert into Altibase table ({self.table_name}): {e}")

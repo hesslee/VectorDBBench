@@ -1,12 +1,15 @@
+import os
 from typing import ClassVar, TypedDict
 
 from pydantic import BaseModel, SecretStr
 
 from ..api import DBCaseConfig, DBConfig, IndexType, MetricType
 
-# Default location of the Altibase ODBC driver shared object.
-# Override with --odbc-driver (CLI) or the odbc_driver config field.
-DEFAULT_ALTIBASE_ODBC_DRIVER = "/home/hess/work/altidev4/altibase_home/lib/libaltibase_odbc-64bit-ul64.so"
+# Default driver / CLI library locations, derived from ALTIBASE_HOME when set.
+# Override with --odbc-driver / --cli-lib (CLI) or the config fields.
+_ALTIBASE_HOME = os.environ.get("ALTIBASE_HOME", "/home/hess/work/altidev4/altibase_home")
+DEFAULT_ALTIBASE_ODBC_DRIVER = f"{_ALTIBASE_HOME}/lib/libaltibase_odbc-64bit-ul64.so"
+DEFAULT_ALTIBASE_CLI_LIB = f"{_ALTIBASE_HOME}/lib/libodbccli_sl.so"
 
 
 class AltibaseConfigDict(TypedDict):
@@ -14,6 +17,10 @@ class AltibaseConfigDict(TypedDict):
 
     connection_string: str
     table_name: str
+    # Binary (SQL_C_VECTOR) insert path via the CLI library.
+    cli_connection_string: str
+    cli_lib: str
+    use_binary_bind: bool
 
 
 class AltibaseConfig(DBConfig):
@@ -32,6 +39,10 @@ class AltibaseConfig(DBConfig):
     dsn: str = ""
     odbc_driver: str = DEFAULT_ALTIBASE_ODBC_DRIVER
     table_name: str = "vdbbench"
+    # Binary VECTOR insert via the CLI library (SQL_C_VECTOR); much faster than
+    # text bind. Uses host/port/user/password directly (not the DSN).
+    use_binary_bind: bool = True
+    cli_lib: str = DEFAULT_ALTIBASE_CLI_LIB
 
     # dsn is legitimately empty when connecting DSN-less.
     _extra_empty_skip: ClassVar[frozenset[str]] = frozenset({"dsn"})
@@ -48,7 +59,17 @@ class AltibaseConfig(DBConfig):
                 f"UID={user};PWD={pwd};"
                 f"DATABASE={self.db_name};ServerType=Altibase"
             )
-        return {"connection_string": connection_string, "table_name": self.table_name}
+        # CLI-library connection string (Altibase keyword form) for binary bind.
+        cli_connection_string = (
+            f"Server={self.host};PORT_NO={self.port};User={user};Password={pwd}"
+        )
+        return {
+            "connection_string": connection_string,
+            "table_name": self.table_name,
+            "cli_connection_string": cli_connection_string,
+            "cli_lib": self.cli_lib,
+            "use_binary_bind": self.use_binary_bind,
+        }
 
 
 class AltibaseIndexConfig(BaseModel, DBCaseConfig):

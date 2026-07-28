@@ -11,7 +11,7 @@ from ....cli.cli import (
     click_parameter_decorators_from_typed_dict,
     run,
 )
-from .config import DEFAULT_ALTIBASE_ODBC_DRIVER
+from .config import DEFAULT_ALTIBASE_CLI_LIB, DEFAULT_ALTIBASE_ODBC_DRIVER
 
 
 class AltibaseTypedDict(CommonTypedDict):
@@ -54,6 +54,25 @@ class AltibaseTypedDict(CommonTypedDict):
             show_default=True,
         ),
     ]
+    binary_bind: Annotated[
+        bool,
+        click.option(
+            "--binary-bind/--no-binary-bind",
+            default=True,
+            show_default=True,
+            help="Insert vectors via the binary SQL_C_VECTOR path (fast) vs text bind",
+        ),
+    ]
+    cli_lib: Annotated[
+        str,
+        click.option(
+            "--cli-lib",
+            type=str,
+            help="Path to the Altibase CLI library (libodbccli_sl.so) for binary bind",
+            default=DEFAULT_ALTIBASE_CLI_LIB,
+            show_default=True,
+        ),
+    ]
 
 
 class AltibaseHNSWTypedDict(AltibaseTypedDict):
@@ -84,13 +103,15 @@ def AltibaseHNSW(**parameters: Unpack[AltibaseHNSWTypedDict]):
         db=DB.Altibase,
         db_config=AltibaseConfig(
             db_label=parameters["db_label"],
-            user_name=SecretStr(parameters["user_name"]),
+            user_name=SecretStr(parameters["username"]),
             password=SecretStr(parameters["password"]),
             host=parameters["host"],
             port=parameters["port"],
             db_name=parameters["db_name"],
             dsn=parameters["dsn"],
             odbc_driver=parameters["odbc_driver"],
+            use_binary_bind=parameters["binary_bind"],
+            cli_lib=parameters["cli_lib"],
         ),
         db_case_config=AltibaseHNSWConfig(
             M=parameters["m"],
