@@ -1,15 +1,24 @@
 """Wrapper around Altibase (VECTOR + HNSW) over the VectorDB interface.
 
-Connectivity is pyodbc -> unixODBC -> Altibase ODBC driver. Vectors are bound
-as text literals '[v, v, ...]' (the path proven to work through pyodbc); the
-binary SQL_C_VECTOR fast path is not reachable from pyodbc and is left as a
-follow-on. KNN uses Altibase's ORDER BY <distance-fn> ... LIMIT k pattern with
-the /*+ HNSW_EF_SEARCH(n) */ hint.
+Connectivity is pyodbc -> unixODBC -> Altibase ODBC driver. Three insert paths,
+selected by bind_mode:
+
+  * "binary" (default): bind the vector as raw little-endian float32 bytes
+    (SQL_C_BINARY) via plain pyodbc; the server converts BINARY -> VECTOR. No
+    ctypes, no CLI library.
+  * "vector": ctypes -> Altibase CLI library, binding the custom SQL_C_VECTOR
+    C type (see altibase_odbc.BinaryVectorInserter).
+  * "text": inline the vector as a '[v, v, ...]' literal (works everywhere,
+    slowest; capped at ~2000 dim by the VARCHAR 32000-byte limit).
+
+KNN uses Altibase's ORDER BY <distance-fn> ... LIMIT k with the
+/*+ HNSW_EF_SEARCH(n) */ hint.
 """
 
 import logging
 from contextlib import contextmanager
 
+import numpy as np
 import pyodbc
 
 from vectordb_bench.backend.filter import Filter, FilterOp
@@ -52,7 +61,8 @@ class Altibase(VectorDB):
 
         self.cli_connection_string = db_config.get("cli_connection_string", "")
         self.cli_lib = db_config.get("cli_lib", "")
-        self.use_binary_bind = db_config.get("use_binary_bind", False)
+        # "binary" (pyodbc bytes), "vector" (ctypes SQL_C_VECTOR), or "text".
+        self.bind_mode = db_config.get("bind_mode", "binary")
 
         self._index_name = f"{self.table_name}_hnsw"
         self._primary_field = "id"
@@ -83,6 +93,11 @@ class Altibase(VectorDB):
         """Render a vector as an Altibase text literal '[v, v, ...]'."""
         return "[" + ",".join(map(str, vector)) + "]"
 
+    @staticmethod
+    def _vec_bytes(vector) -> bytes:
+        """Raw little-endian float32 bytes; server converts BINARY -> VECTOR."""
+        return np.asarray(vector, dtype="<f4").tobytes()
+
     def _drop_table(self):
         # No "IF EXISTS" in Altibase; ignore "table not found".
         try:
@@ -111,20 +126,22 @@ class Altibase(VectorDB):
             f"({self._primary_field}, {self._vector_field}) VALUES (?, ?)"
         )
 
-        # Open a dedicated CLI connection for the binary SQL_C_VECTOR insert
-        # path. If it can't be established, fall back to text inserts.
+        # "vector" mode needs a dedicated CLI connection for the SQL_C_VECTOR
+        # bind. If it can't be established, fall back to the pyodbc text path.
         self._binary = None
-        if self.use_binary_bind:
+        if self.bind_mode == "vector":
             try:
                 self._binary = BinaryVectorInserter(
                     self.cli_lib, self.cli_connection_string,
                     self.table_name, self.dim,
                     id_field=self._primary_field, vec_field=self._vector_field,
                 )
-                log.info(f"{self.name}: binary VECTOR bind enabled (SQL_C_VECTOR)")
+                log.info(f"{self.name}: bind_mode=vector (ctypes SQL_C_VECTOR)")
             except Exception as e:
-                log.warning(f"{self.name}: binary bind unavailable, using text bind: {e}")
+                log.warning(f"{self.name}: SQL_C_VECTOR unavailable, using text bind: {e}")
                 self._binary = None
+        else:
+            log.info(f"{self.name}: bind_mode={self.bind_mode}")
 
         try:
             yield
@@ -155,25 +172,32 @@ class Altibase(VectorDB):
             take = max(0, min(remaining, len(metadata)))
 
         try:
-            if self._binary is not None:
-                # Fast path: raw float[dim] array via SQL_C_VECTOR (no parsing).
-                if take:
-                    self._binary.insert(metadata[:take], embeddings[:take])
+            if take == 0:
+                pass
+            elif self._binary is not None:
+                # "vector": raw float[dim] array via ctypes SQL_C_VECTOR.
+                self._binary.insert(metadata[:take], embeddings[:take])
+            elif self.bind_mode == "binary":
+                # "binary": bind raw float32 bytes (SQL_C_BINARY); the server's
+                # BINARY -> VECTOR conversion builds the vector. Pure pyodbc.
+                rows = [
+                    (int(metadata[i]), self._vec_bytes(embeddings[i]))
+                    for i in range(take)
+                ]
+                self.cursor.executemany(self._insert_sql, rows)
+                self.conn.commit()
             else:
-                # Text fallback: inline the vector as a literal rather than
-                # binding it. A long bound string makes pyodbc pick
-                # SQL_WLONGVARCHAR (HY004) or stream via SQLPutData (HY019), both
-                # rejected by the driver; inlining sidesteps ODBC type inference
-                # (same approach as search_embedding). The literal is digits,
-                # comma, minus, dot and 'e' only, so there is no injection surface.
+                # "text": inline the vector as a literal. A long bound string
+                # makes pyodbc pick SQL_WLONGVARCHAR (HY004) or stream via
+                # SQLPutData (HY019), both rejected; inlining sidesteps ODBC type
+                # inference. Literal is digits, comma, minus, dot, 'e' -> safe.
                 for i in range(take):
                     self.cursor.execute(
                         f"INSERT INTO {self.table_name} "
                         f"({self._primary_field}, {self._vector_field}) "
                         f"VALUES ({int(metadata[i])}, '{self._vec_literal(embeddings[i])}')"
                     )
-                if take:
-                    self.conn.commit()
+                self.conn.commit()
             self._inserted_total += take
             if take < len(metadata):
                 log.info(
@@ -237,11 +261,26 @@ class Altibase(VectorDB):
         assert self.conn is not None, "Connection is not initialized"
         assert self.cursor is not None, "Cursor is not initialized"
 
-        q = self._vec_literal(query)
-        sql = (
-            f"SELECT {self._hint}{self._primary_field} FROM {self.table_name} "
-            f"{self.where_clause} "
-            f"ORDER BY {self._distance_fn}({self._vector_field}, '{q}') LIMIT {int(k)}"
-        )
-        self.cursor.execute(sql)
+        if self.bind_mode == "text":
+            # inline the query vector as a text literal
+            sql = (
+                f"SELECT {self._hint}{self._primary_field} FROM {self.table_name} "
+                f"{self.where_clause} "
+                f"ORDER BY {self._distance_fn}({self._vector_field}, "
+                f"'{self._vec_literal(query)}') LIMIT {int(k)}"
+            )
+            self.cursor.execute(sql)
+        else:
+            # Inline the query vector as a BYTE binary literal of raw float32
+            # bytes; the server hex-decodes and converts BYTE -> VECTOR. A host
+            # variable ('?') is rejected in the KNN ORDER BY (it would defeat
+            # index-plan detection), so a constant literal is required -- this
+            # keeps the HNSW index scan while avoiding per-float text parsing.
+            hexstr = self._vec_bytes(query).hex()
+            sql = (
+                f"SELECT {self._hint}{self._primary_field} FROM {self.table_name} "
+                f"{self.where_clause} "
+                f"ORDER BY {self._distance_fn}({self._vector_field}, BYTE'{hexstr}') LIMIT {int(k)}"
+            )
+            self.cursor.execute(sql)
         return [row[0] for row in self.cursor.fetchall()]

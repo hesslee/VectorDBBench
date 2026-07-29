@@ -17,10 +17,10 @@ class AltibaseConfigDict(TypedDict):
 
     connection_string: str
     table_name: str
-    # Binary (SQL_C_VECTOR) insert path via the CLI library.
+    # Insert path: "binary" (pyodbc bytes), "vector" (ctypes SQL_C_VECTOR), "text".
+    bind_mode: str
     cli_connection_string: str
     cli_lib: str
-    use_binary_bind: bool
 
 
 class AltibaseConfig(DBConfig):
@@ -39,9 +39,9 @@ class AltibaseConfig(DBConfig):
     dsn: str = ""
     odbc_driver: str = DEFAULT_ALTIBASE_ODBC_DRIVER
     table_name: str = "vdbbench"
-    # Binary VECTOR insert via the CLI library (SQL_C_VECTOR); much faster than
-    # text bind. Uses host/port/user/password directly (not the DSN).
-    use_binary_bind: bool = True
+    # Insert path: "binary" (raw float32 bytes via pyodbc, server BINARY->VECTOR),
+    # "vector" (ctypes SQL_C_VECTOR via the CLI lib), or "text".
+    bind_mode: str = "binary"
     cli_lib: str = DEFAULT_ALTIBASE_CLI_LIB
 
     # dsn is legitimately empty when connecting DSN-less.
@@ -59,16 +59,16 @@ class AltibaseConfig(DBConfig):
                 f"UID={user};PWD={pwd};"
                 f"DATABASE={self.db_name};ServerType=Altibase"
             )
-        # CLI-library connection string (Altibase keyword form) for binary bind.
+        # CLI-library connection string (Altibase keyword form) for "vector" mode.
         cli_connection_string = (
             f"Server={self.host};PORT_NO={self.port};User={user};Password={pwd}"
         )
         return {
             "connection_string": connection_string,
             "table_name": self.table_name,
+            "bind_mode": self.bind_mode,
             "cli_connection_string": cli_connection_string,
             "cli_lib": self.cli_lib,
-            "use_binary_bind": self.use_binary_bind,
         }
 
 

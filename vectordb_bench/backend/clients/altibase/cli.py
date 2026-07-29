@@ -54,13 +54,14 @@ class AltibaseTypedDict(CommonTypedDict):
             show_default=True,
         ),
     ]
-    binary_bind: Annotated[
-        bool,
+    bind_mode: Annotated[
+        str,
         click.option(
-            "--binary-bind/--no-binary-bind",
-            default=True,
+            "--bind-mode",
+            type=click.Choice(["binary", "vector", "text"]),
+            default="binary",
             show_default=True,
-            help="Insert vectors via the binary SQL_C_VECTOR path (fast) vs text bind",
+            help="Insert path: binary=pyodbc float32 bytes, vector=ctypes SQL_C_VECTOR, text=literal",
         ),
     ]
     cli_lib: Annotated[
@@ -110,7 +111,7 @@ def AltibaseHNSW(**parameters: Unpack[AltibaseHNSWTypedDict]):
             db_name=parameters["db_name"],
             dsn=parameters["dsn"],
             odbc_driver=parameters["odbc_driver"],
-            use_binary_bind=parameters["binary_bind"],
+            bind_mode=parameters["bind_mode"],
             cli_lib=parameters["cli_lib"],
         ),
         db_case_config=AltibaseHNSWConfig(
