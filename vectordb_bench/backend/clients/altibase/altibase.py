@@ -308,16 +308,18 @@ class Altibase(VectorDB):
             )
             cursor.execute(sql)
         else:
-            # Inline the query vector as a BYTE binary literal of raw float32
-            # bytes; the server hex-decodes and converts BYTE -> VECTOR. A host
-            # variable ('?') is rejected in the KNN ORDER BY (it would defeat
-            # index-plan detection), so a constant literal is required -- this
-            # keeps the HNSW index scan while avoiding per-float text parsing.
-            hexstr = self._vec_bytes(query).hex()
+            # Bind the query vector as a parameter: raw little-endian float32
+            # bytes (SQL_VARBINARY), which the server converts BINARY -> VECTOR in
+            # the distance-function argument. The SQL text is constant across
+            # queries, so pyodbc reuses the prepared statement and the server can
+            # cache the plan -- unlike inlining a fresh multi-KB BYTE literal on
+            # every call. A host-variable query vector in the KNN ORDER BY is
+            # accepted by the server (qmvOrderBy exemption for vector distance
+            # functions) and still runs the HNSW K-NN index scan.
             sql = (
                 f"SELECT {self._hint}{self._primary_field} FROM {self.table_name} "
                 f"{self.where_clause} "
-                f"ORDER BY {self._distance_fn}({self._vector_field}, BYTE'{hexstr}') LIMIT {int(k)}"
+                f"ORDER BY {self._distance_fn}({self._vector_field}, ?) LIMIT {int(k)}"
             )
-            cursor.execute(sql)
+            cursor.execute(sql, self._vec_bytes(query))
         return [row[0] for row in cursor.fetchall()]
