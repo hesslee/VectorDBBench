@@ -96,6 +96,19 @@ class Altibase(VectorDB):
             cursor.close()
             conn.close()
 
+    def __getstate__(self):
+        # VectorDBBench pickles the client to hand it to subprocesses (the load
+        # task and each search process). threading.local() and live pyodbc
+        # connections are not picklable, so drop the per-thread state; the
+        # unpickled copy re-opens its own connections lazily via _thread_conn().
+        state = self.__dict__.copy()
+        state.pop("_local", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._local = threading.local()
+
     @staticmethod
     def _create_connection(connection_string: str):
         conn = pyodbc.connect(connection_string, autocommit=False, timeout=30)
