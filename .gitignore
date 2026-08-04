@@ -20,3 +20,6 @@ vectordb_bench/results/Altibase/
 # AI rules
 CLAUDE.md
 AGENTS.md
+
+# Altibase failback test snapshots
+tests/altibase_failback_out/
