@@ -93,16 +93,22 @@ INST = {
 
 
 def isolate_odbc_config():
-    """Make the DSN-less ODBC connections hermetic.
+    """Make the DSN-less ODBC connections hermetic (defensive fallback).
 
-    A DSN-less ``DRIVER=<path>`` connection needs no system ``odbc.ini``, but
-    unixODBC still reads it -- and a stray/misconfigured DSN there (observed on
-    this host: an ``/etc/odbc.ini`` ``[PYODBC]`` entry) makes the Altibase driver
-    reject the connect with ``HY024`` (INVALID_ATTRIBUTE_VALUE, native 331797),
-    which would equally break the real VectorDBBench Altibase client. Point
-    ``ODBCSYSINI`` at a clean dir (minimal ``odbcinst.ini``, no ``odbc.ini``) so a
-    connection depends only on the ``DRIVER=`` string. Respect an ``ODBCSYSINI``
-    the caller already set. Must run before the first pyodbc connect.
+    Root cause, now fixed in the Altibase driver: a DSN-less ``DRIVER=<path>``
+    connect has no DSN, but the driver still read odbc.ini profile attributes with
+    a NULL DSN, so ``SQLGetPrivateProfileString(NULL, ...)`` returned the odbc.ini
+    section-name list, which got mis-applied as the first attribute's value ->
+    ``HY024`` (INVALID_ATTRIBUTE_VALUE, native 331797). A stray ``/etc/odbc.ini``
+    ``[PYODBC]`` DSN then broke every DSN-less connect (this client included). The
+    driver now skips the profile read when the DSN is NULL/empty
+    (``ulnSetConnAttrByProfileFunc`` in ``src/ul/uln/ulnSetConnectAttr.c``).
+
+    With a patched driver this is unnecessary; kept as a fallback for older /
+    unpatched drivers (and general hermeticity): point ``ODBCSYSINI`` at a clean
+    dir (minimal ``odbcinst.ini``, no ``odbc.ini``) so a connect depends only on
+    the ``DRIVER=`` string. Respect an ``ODBCSYSINI`` the caller already set. Must
+    run before the first pyodbc connect.
     """
     if os.environ.get("ODBCSYSINI"):
         return
