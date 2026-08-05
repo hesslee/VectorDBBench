@@ -49,7 +49,6 @@ import time
 import random
 import shutil
 import difflib
-import tempfile
 import threading
 import subprocess
 
@@ -92,32 +91,6 @@ INST = {
 }
 
 
-def isolate_odbc_config():
-    """Make the DSN-less ODBC connections hermetic (defensive fallback).
-
-    Root cause, now fixed in the Altibase driver: a DSN-less ``DRIVER=<path>``
-    connect has no DSN, but the driver still read odbc.ini profile attributes with
-    a NULL DSN, so ``SQLGetPrivateProfileString(NULL, ...)`` returned the odbc.ini
-    section-name list, which got mis-applied as the first attribute's value ->
-    ``HY024`` (INVALID_ATTRIBUTE_VALUE, native 331797). A stray ``/etc/odbc.ini``
-    ``[PYODBC]`` DSN then broke every DSN-less connect (this client included). The
-    driver now skips the profile read when the DSN is NULL/empty
-    (``ulnSetConnAttrByProfileFunc`` in ``src/ul/uln/ulnSetConnectAttr.c``).
-
-    With a patched driver this is unnecessary; kept as a fallback for older /
-    unpatched drivers (and general hermeticity): point ``ODBCSYSINI`` at a clean
-    dir (minimal ``odbcinst.ini``, no ``odbc.ini``) so a connect depends only on
-    the ``DRIVER=`` string. Respect an ``ODBCSYSINI`` the caller already set. Must
-    run before the first pyodbc connect.
-    """
-    if os.environ.get("ODBCSYSINI"):
-        return
-    d = tempfile.mkdtemp(prefix="vdb_odbc_")
-    with open(os.path.join(d, "odbcinst.ini"), "w") as f:
-        f.write("[ODBC]\nTrace=No\n")
-    os.environ["ODBCSYSINI"] = d
-
-
 # --------------------------------------------------------------------------- #
 # raw pyodbc helpers (setup / snapshot / liveness) -- reuse the client's
 # connection-string builder so there is one source of truth for the ODBC string.
@@ -126,7 +99,7 @@ def _conn_str(inst):
     c = INST[inst]
     return AltibaseConfig(
         host=c["host"], port=int(c["port"]), db_name="mydb",
-        table_name=TABLE, bind_mode="binary",
+        table_name=TABLE,
     ).to_dict()["connection_string"]
 
 
@@ -260,7 +233,7 @@ def build_master_client():
     the DDL (a table in a replication cannot be dropped)."""
     cfg = AltibaseConfig(
         host=INST["s1"]["host"], port=int(INST["s1"]["port"]), db_name="mydb",
-        table_name=TABLE, bind_mode="binary",
+        table_name=TABLE,
     )
     case = AltibaseHNSWConfig(metric_type=MetricType.L2)
     return Altibase(dim=DIM, db_config=cfg.to_dict(), db_case_config=case,
@@ -325,7 +298,6 @@ def compare(standby_file, master_file):
 # main
 # --------------------------------------------------------------------------- #
 def main():
-    isolate_odbc_config()                         # before any pyodbc connect
     if os.path.isdir(OUTDIR):
         shutil.rmtree(OUTDIR)
     os.makedirs(OUTDIR)

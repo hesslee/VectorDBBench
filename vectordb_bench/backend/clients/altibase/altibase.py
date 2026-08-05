@@ -1,25 +1,17 @@
 """Wrapper around Altibase (VECTOR + HNSW) over the VectorDB interface.
 
-Connectivity is pyodbc -> unixODBC -> Altibase ODBC driver. Three insert paths,
-selected by bind_mode:
-
-  * "binary" (default): bind the vector as raw little-endian float32 bytes
-    (SQL_C_BINARY) via plain pyodbc; the server converts BINARY -> VECTOR. No
-    ctypes, no CLI library.
-  * "vector": ctypes -> Altibase CLI library, binding the custom SQL_C_VECTOR
-    C type (see altibase_odbc.BinaryVectorInserter).
-  * "text": inline the vector as a '[v, v, ...]' literal (works everywhere,
-    slowest; capped at ~2000 dim by the VARCHAR 32000-byte limit).
-
-KNN uses Altibase's ORDER BY <distance-fn> ... LIMIT k with the
-/*+ HNSW_EF_SEARCH(n) */ hint.
+Connectivity is pyodbc -> unixODBC -> Altibase ODBC driver (DSN-less). Vectors
+are bound as raw little-endian float32 bytes (SQL_C_BINARY) via plain pyodbc; the
+server converts BINARY -> VECTOR. KNN uses Altibase's ORDER BY <distance-fn> ...
+LIMIT k with the /*+ HNSW_EF_SEARCH(n) */ hint.
 
 Concurrency: a pyodbc connection cannot be shared across threads, so each thread
 gets its OWN connection, held in threading.local() and opened lazily on first
 use. This lets VectorDBBench's thread-based insert runners (concurrent load, and
 the streaming write pool, which share one client instance across worker threads)
 actually run in parallel instead of being clamped to a single worker. Every
-connection a thread opens is registered so init()'s cleanup closes them all.
+connection a thread opens is closed when that thread ends (thread-local storage
+is dropped -> pyodbc closes it), so no cross-thread bookkeeping is needed.
 """
 
 import logging
@@ -32,7 +24,6 @@ import pyodbc
 from vectordb_bench.backend.filter import Filter, FilterOp
 
 from ..api import VectorDB
-from .altibase_odbc import BinaryVectorInserter
 from .config import AltibaseConfigDict, AltibaseHNSWConfig
 
 log = logging.getLogger(__name__)
@@ -66,11 +57,6 @@ class Altibase(VectorDB):
         self.table_name = db_config.get("table_name") or collection_name
         self.case_config = db_case_config
         self.dim = dim
-
-        self.cli_connection_string = db_config.get("cli_connection_string", "")
-        self.cli_lib = db_config.get("cli_lib", "")
-        # "binary" (pyodbc bytes), "vector" (ctypes SQL_C_VECTOR), or "text".
-        self.bind_mode = db_config.get("bind_mode", "binary")
 
         self._index_name = f"{self.table_name}_hnsw"
         self._primary_field = "id"
@@ -118,7 +104,7 @@ class Altibase(VectorDB):
         return conn, cursor
 
     def _thread_conn(self):
-        """Return this thread's (conn, cursor), opening and registering it lazily.
+        """Return this thread's (conn, cursor), opening it lazily.
 
         Worker threads in the concurrent-load and streaming-write pools never call
         init() themselves, so the connection must be created on first use here.
@@ -126,31 +112,12 @@ class Altibase(VectorDB):
         conn = getattr(self._local, "conn", None)
         if conn is None:
             conn, cursor = self._create_connection(self.connection_string)
-            binary = None
-            # "vector" mode wraps a dedicated CLI connection; it too is per-thread.
-            if self.bind_mode == "vector":
-                try:
-                    binary = BinaryVectorInserter(
-                        self.cli_lib, self.cli_connection_string,
-                        self.table_name, self.dim,
-                        id_field=self._primary_field, vec_field=self._vector_field,
-                    )
-                except Exception as e:
-                    log.warning(f"{self.name}: SQL_C_VECTOR unavailable, using bytes/text bind: {e}")
-                    binary = None
             self._local.conn = conn
             self._local.cursor = cursor
-            self._local.binary = binary
         return self._local.conn, self._local.cursor
 
     def _close_thread(self):
         """Close the calling thread's own connection and reset its state."""
-        binary = getattr(self._local, "binary", None)
-        if binary is not None:
-            try:
-                binary.close()
-            except Exception:
-                log.debug("error closing binary inserter", exc_info=True)
         for closer in (getattr(self._local, "cursor", None), getattr(self._local, "conn", None)):
             if closer is not None:
                 try:
@@ -159,12 +126,6 @@ class Altibase(VectorDB):
                     log.debug("error closing connection/cursor", exc_info=True)
         self._local.conn = None
         self._local.cursor = None
-        self._local.binary = None
-
-    @staticmethod
-    def _vec_literal(vector: list[float]) -> str:
-        """Render a vector as an Altibase text literal '[v, v, ...]'."""
-        return "[" + ",".join(map(str, vector)) + "]"
 
     @staticmethod
     def _vec_bytes(vector) -> bytes:
@@ -197,7 +158,7 @@ class Altibase(VectorDB):
             f"INSERT INTO {self.table_name} "
             f"({self._primary_field}, {self._vector_field}) VALUES (?, ?)"
         )
-        log.info(f"{self.name}: bind_mode={self.bind_mode}, thread_safe (per-thread connections)")
+        log.info(f"{self.name}: thread_safe (per-thread connections)")
 
         # Open the calling thread's connection eagerly so single-threaded callers
         # (search processes, DDL) have one immediately.
@@ -224,31 +185,14 @@ class Altibase(VectorDB):
             take = max(0, min(remaining, len(metadata)))
 
         try:
-            if take == 0:
-                pass
-            elif self._local.binary is not None:
-                # "vector": raw float[dim] array via ctypes SQL_C_VECTOR.
-                self._local.binary.insert(metadata[:take], embeddings[:take])
-            elif self.bind_mode == "binary":
-                # "binary": bind raw float32 bytes (SQL_C_BINARY); the server's
+            if take > 0:
+                # Bind raw float32 bytes (SQL_C_BINARY); the server's
                 # BINARY -> VECTOR conversion builds the vector. Pure pyodbc.
                 rows = [
                     (int(metadata[i]), self._vec_bytes(embeddings[i]))
                     for i in range(take)
                 ]
                 cursor.executemany(self._insert_sql, rows)
-                conn.commit()
-            else:
-                # "text": inline the vector as a literal. A long bound string
-                # makes pyodbc pick SQL_WLONGVARCHAR (HY004) or stream via
-                # SQLPutData (HY019), both rejected; inlining sidesteps ODBC type
-                # inference. Literal is digits, comma, minus, dot, 'e' -> safe.
-                for i in range(take):
-                    cursor.execute(
-                        f"INSERT INTO {self.table_name} "
-                        f"({self._primary_field}, {self._vector_field}) "
-                        f"VALUES ({int(metadata[i])}, '{self._vec_literal(embeddings[i])}')"
-                    )
                 conn.commit()
             self._inserted_total += take
             if take < len(metadata):
@@ -311,28 +255,17 @@ class Altibase(VectorDB):
     ) -> list[int]:
         _, cursor = self._thread_conn()
 
-        if self.bind_mode == "text":
-            # inline the query vector as a text literal
-            sql = (
-                f"SELECT {self._hint}{self._primary_field} FROM {self.table_name} "
-                f"{self.where_clause} "
-                f"ORDER BY {self._distance_fn}({self._vector_field}, "
-                f"'{self._vec_literal(query)}') LIMIT {int(k)}"
-            )
-            cursor.execute(sql)
-        else:
-            # Bind the query vector as a parameter: raw little-endian float32
-            # bytes (SQL_VARBINARY), which the server converts BINARY -> VECTOR in
-            # the distance-function argument. The SQL text is constant across
-            # queries, so pyodbc reuses the prepared statement and the server can
-            # cache the plan -- unlike inlining a fresh multi-KB BYTE literal on
-            # every call. A host-variable query vector in the KNN ORDER BY is
-            # accepted by the server (qmvOrderBy exemption for vector distance
-            # functions) and still runs the HNSW K-NN index scan.
-            sql = (
-                f"SELECT {self._hint}{self._primary_field} FROM {self.table_name} "
-                f"{self.where_clause} "
-                f"ORDER BY {self._distance_fn}({self._vector_field}, ?) LIMIT {int(k)}"
-            )
-            cursor.execute(sql, self._vec_bytes(query))
+        # Bind the query vector as a parameter: raw little-endian float32 bytes
+        # (SQL_VARBINARY), which the server converts BINARY -> VECTOR in the
+        # distance-function argument. The SQL text is constant across queries, so
+        # pyodbc reuses the prepared statement and the server can cache the plan.
+        # A host-variable query vector in the KNN ORDER BY is accepted by the
+        # server (qmvOrderBy exemption for vector distance functions) and still
+        # runs the HNSW K-NN index scan.
+        sql = (
+            f"SELECT {self._hint}{self._primary_field} FROM {self.table_name} "
+            f"{self.where_clause} "
+            f"ORDER BY {self._distance_fn}({self._vector_field}, ?) LIMIT {int(k)}"
+        )
+        cursor.execute(sql, self._vec_bytes(query))
         return [row[0] for row in cursor.fetchall()]

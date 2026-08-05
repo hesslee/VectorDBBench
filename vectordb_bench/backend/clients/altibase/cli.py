@@ -11,7 +11,7 @@ from ....cli.cli import (
     click_parameter_decorators_from_typed_dict,
     run,
 )
-from .config import DEFAULT_ALTIBASE_CLI_LIB, DEFAULT_ALTIBASE_ODBC_DRIVER
+from .config import DEFAULT_ALTIBASE_ODBC_DRIVER
 
 
 class AltibaseTypedDict(CommonTypedDict):
@@ -35,42 +35,13 @@ class AltibaseTypedDict(CommonTypedDict):
         str,
         click.option("--db-name", type=str, help="Database name", default="mydb", show_default=True),
     ]
-    dsn: Annotated[
-        str,
-        click.option(
-            "--dsn",
-            type=str,
-            help="unixODBC DSN name (from /etc/odbc.ini); if set, overrides --odbc-driver/host/port",
-            default="",
-        ),
-    ]
     odbc_driver: Annotated[
         str,
         click.option(
             "--odbc-driver",
             type=str,
-            help="Path to the Altibase ODBC driver .so (used when --dsn is not given)",
+            help="Path to the Altibase ODBC driver .so",
             default=DEFAULT_ALTIBASE_ODBC_DRIVER,
-            show_default=True,
-        ),
-    ]
-    bind_mode: Annotated[
-        str,
-        click.option(
-            "--bind-mode",
-            type=click.Choice(["binary", "vector", "text"]),
-            default="binary",
-            show_default=True,
-            help="Insert path: binary=pyodbc float32 bytes, vector=ctypes SQL_C_VECTOR, text=literal",
-        ),
-    ]
-    cli_lib: Annotated[
-        str,
-        click.option(
-            "--cli-lib",
-            type=str,
-            help="Path to the Altibase CLI library (libodbccli_sl.so) for binary bind",
-            default=DEFAULT_ALTIBASE_CLI_LIB,
             show_default=True,
         ),
     ]
@@ -109,10 +80,7 @@ def AltibaseHNSW(**parameters: Unpack[AltibaseHNSWTypedDict]):
             host=parameters["host"],
             port=parameters["port"],
             db_name=parameters["db_name"],
-            dsn=parameters["dsn"],
             odbc_driver=parameters["odbc_driver"],
-            bind_mode=parameters["bind_mode"],
-            cli_lib=parameters["cli_lib"],
         ),
         db_case_config=AltibaseHNSWConfig(
             M=parameters["m"],
