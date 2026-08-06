@@ -16,6 +16,7 @@ class AltibaseConfigDict(TypedDict):
 
     connection_string: str
     table_name: str
+    tablespace: str
 
 
 class AltibaseConfig(DBConfig):
@@ -32,6 +33,10 @@ class AltibaseConfig(DBConfig):
     db_name: str = "mydb"
     odbc_driver: str = DEFAULT_ALTIBASE_ODBC_DRIVER
     table_name: str = "vdbbench"
+    # Tablespace for the data table. Empty -> the default (memory) tablespace,
+    # which routes to the in-memory HNSW (smnh). Set to a disk data tablespace
+    # (e.g. SYS_TBS_DISK_DATA) to exercise the on-disk HNSW (sdnh) path.
+    tablespace: str = ""
 
     def to_dict(self) -> AltibaseConfigDict:
         user = self.user_name.get_secret_value()
@@ -45,6 +50,7 @@ class AltibaseConfig(DBConfig):
         return {
             "connection_string": connection_string,
             "table_name": self.table_name,
+            "tablespace": self.tablespace,
         }
 
 

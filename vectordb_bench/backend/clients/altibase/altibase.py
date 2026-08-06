@@ -55,6 +55,9 @@ class Altibase(VectorDB):
         self.name = "Altibase"
         self.connection_string = db_config["connection_string"]
         self.table_name = db_config.get("table_name") or collection_name
+        # Empty -> default (memory) tablespace; a disk tablespace name routes the
+        # table (and thus its HNSW index) to the on-disk sdnh path.
+        self.tablespace = db_config.get("tablespace") or ""
         self.case_config = db_case_config
         self.dim = dim
 
@@ -141,9 +144,10 @@ class Altibase(VectorDB):
             conn.rollback()
 
     def _create_table(self, conn, cursor, dim: int):
+        tbs = f" TABLESPACE {self.tablespace}" if self.tablespace else ""
         cursor.execute(
             f"CREATE TABLE {self.table_name} "
-            f"({self._primary_field} BIGINT PRIMARY KEY, {self._vector_field} VECTOR({dim}))"
+            f"({self._primary_field} BIGINT PRIMARY KEY, {self._vector_field} VECTOR({dim})){tbs}"
         )
         conn.commit()
 

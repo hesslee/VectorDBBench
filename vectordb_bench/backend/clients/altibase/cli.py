@@ -45,6 +45,16 @@ class AltibaseTypedDict(CommonTypedDict):
             show_default=True,
         ),
     ]
+    tablespace: Annotated[
+        str,
+        click.option(
+            "--tablespace",
+            type=str,
+            help="Data-table tablespace; empty=memory HNSW, e.g. SYS_TBS_DISK_DATA for on-disk HNSW",
+            default="",
+            show_default=True,
+        ),
+    ]
 
 
 class AltibaseHNSWTypedDict(AltibaseTypedDict):
@@ -81,6 +91,7 @@ def AltibaseHNSW(**parameters: Unpack[AltibaseHNSWTypedDict]):
             port=parameters["port"],
             db_name=parameters["db_name"],
             odbc_driver=parameters["odbc_driver"],
+            tablespace=parameters["tablespace"],
         ),
         db_case_config=AltibaseHNSWConfig(
             M=parameters["m"],
